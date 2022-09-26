@@ -1,0 +1,298 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# import lib\n",
+    "import os\n",
+    "from tqdm import tqdm\n",
+    "\n",
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "\n",
+    "import matplotlib.pyplot as plt\n",
+    "import cv2\n",
+    "\n",
+    "import faiss\n",
+    "from scipy.cluster import vq\n",
+    "from sklearn.cluster import KMeans\n",
+    "from sklearn.svm import SVC\n",
+    "from sklearn.model_selection import GridSearchCV"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Set data path\n",
+    "BASE_PATH = '/home/silee/workspace/bovw/dataset'\n",
+    "\n",
+    "TRAIN_DATA_PATH = os.path.join(BASE_PATH, 'train')\n",
+    "TEST_DATA_PATH = os.path.join(BASE_PATH, 'test')\n",
+    "SUBMIT_PATH = os.path.join(BASE_PATH, 'submission.csv')\n",
+    "\n",
+    "label2name = pd.read_csv(os.path.join(BASE_PATH, 'Label2Names.csv'), header=None)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 37,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_dataset(split):\n",
+    "    split = split.upper()\n",
+    "\n",
+    "    if split == 'TRAIN':\n",
+    "        train_labels, train_images = [], []\n",
+    "        for class_label in tqdm(os.listdir(TRAIN_DATA_PATH)):\n",
+    "            if class_label == 'BACKGROUND_Google':\n",
+    "                label_index = 102\n",
+    "            else:\n",
+    "                label_index = label2name.loc[label2name[1] == class_label].iloc[0][0]\n",
+    "              \n",
+    "            for flatten_1d in os.listdir(os.path.join(TRAIN_DATA_PATH, class_label)):\n",
+    "                image = np.array(pd.read_csv(os.path.join(TRAIN_DATA_PATH, class_label, flatten_1d))).reshape((256, 256, 3))\n",
+    "\n",
+    "                train_labels.append(label_index)\n",
+    "                train_images.append(image)\n",
+    "\n",
+    "        return np.array(train_labels), np.array(train_images)\n",
+    "\n",
+    "    else:\n",
+    "        test_labels, test_images = [], []\n",
+    "        for csv in tqdm(sorted(os.listdir(TEST_DATA_PATH))):\n",
+    "            image = np.array(pd.read_csv(os.path.join(TEST_DATA_PATH, csv))).reshape((256, 256, 3))\n",
+    "\n",
+    "            test_labels.append(csv)\n",
+    "            test_images.append(image)\n",
+    "\n",
+    "        return np.array(test_labels), np.array(test_images)    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 38,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def extract_descriptor(image, dense=False):\n",
+    "    image = np.uint8(image)\n",
+    "    img2gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)\n",
+    "\n",
+    "    sift = cv2.SIFT_create()\n",
+    "    if dense:\n",
+    "        step = 8\n",
+    "        kp = [cv2.KeyPoint(x, y, step) for x in range(0, img2gray.shape[1], step)\n",
+    "                                       for y in range(0, img2gray.shape[0], step)]\n",
+    "\n",
+    "        _, desc = sift.compute(img2gray, kp)\n",
+    "\n",
+    "    else:\n",
+    "        _, desc = sift.detectAndCompute(img2gray, None)\n",
+    "        \n",
+    "    return desc"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 39,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_codebook_GPU(desc, num_of_cluster):\n",
+    "    feature=np.array(desc).reshape(-1,128).astype('float32')\n",
+    "    \n",
+    "    d=feature.shape[1]\n",
+    "    k=num_of_cluster\n",
+    "\n",
+    "    clus = faiss.Clustering(d, k)\n",
+    "    clus.niter = 300\n",
+    "    clus.seed = 10\n",
+    "    clus.max_points_per_centroid = 10000000\n",
+    "    ngpu=1\n",
+    "    \n",
+    "    res = [faiss.StandardGpuResources() for i in range(ngpu)]\n",
+    "    \n",
+    "    flat_config = []\n",
+    "    for i in range(ngpu):\n",
+    "        cfg = faiss.GpuIndexFlatConfig()\n",
+    "        cfg.useFloat16 = False\n",
+    "        cfg.device = i\n",
+    "        flat_config.append(cfg)\n",
+    "    if ngpu == 1:\n",
+    "        index = faiss.GpuIndexFlatL2(res[0], d, flat_config[0])\n",
+    "    \n",
+    "    clus.train(feature, index)\n",
+    "    centroids = faiss.vector_float_to_array(clus.centroids)\n",
+    "    centroids=centroids.reshape(k, d)\n",
+    "\n",
+    "    return centroids"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def find_codebook(desc, num_of_cluster):\n",
+    "    kmeans = KMeans(n_clusters=num_of_cluster)\n",
+    "    kmeans.fit(desc)\n",
+    "\n",
+    "    return kmeans.cluster_centers_"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def find_hist(desc, codebook):\n",
+    "    codebook_index, _ = vq.vq(desc, codebook)\n",
+    "    hist, _ = np.histogram(codebook_index, bins=range(codebook.shape[0] + 1))\n",
+    "\n",
+    "    return np.array(hist)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def model_SVM(x_train, y_train, x_test, params):\n",
+    "    svm = SVC()\n",
+    "\n",
+    "    clf = GridSearchCV(svm, params)\n",
+    "    clf.fit(x_train, y_train)\n",
+    "\n",
+    "    pred = clf.predict(x_test)\n",
+    "\n",
+    "    return pred"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 102/102 [00:39<00:00,  2.60it/s]\n",
+      "100%|██████████| 1712/1712 [00:25<00:00, 65.85it/s]\n",
+      "100%|██████████| 3060/3060 [00:32<00:00, 94.60it/s] \n",
+      "100%|██████████| 1712/1712 [00:19<00:00, 86.84it/s] \n",
+      "100%|██████████| 3060/3060 [00:05<00:00, 539.70it/s]\n",
+      "100%|██████████| 1712/1712 [00:03<00:00, 554.02it/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "if __name__ == \"__main__\":\n",
+    "    # Load dataset\n",
+    "    train_labels, train_images = load_dataset(split='train')\n",
+    "    test_labels, test_images  = load_dataset(split='test')\n",
+    "\n",
+    "    # Extract descriptor\n",
+    "    x_train_desc = []\n",
+    "    for train_image in tqdm(train_images):\n",
+    "        desc = extract_descriptor(train_image, dense=True)\n",
+    "        x_train_desc.append(desc)\n",
+    "\n",
+    "    x_train_desc = np.array(x_train_desc)\n",
+    "\n",
+    "    # Find codebook\n",
+    "    # codebook = find_codebook(x_train_desc, num_of_cluster=200)\n",
+    "    codebook = build_codebook_GPU(x_train_desc, num_of_cluster=200)\n",
+    "\n",
+    "    # Extract descriptor\n",
+    "    x_test_desc = []\n",
+    "    for test_image in tqdm(test_images):\n",
+    "        desc = extract_descriptor(test_image, dense=True)\n",
+    "        x_test_desc.append(desc)\n",
+    "\n",
+    "    x_test_desc = np.array(x_test_desc)\n",
+    "\n",
+    "    # x_train data\n",
+    "    x_train = []\n",
+    "    for index in tqdm(range(len(train_images))):\n",
+    "        hist = find_hist(x_train_desc[index], codebook)\n",
+    "        x_train.append(hist)\n",
+    "\n",
+    "    x_train = np.array(x_train)\n",
+    "\n",
+    "    # x_test data\n",
+    "    x_test = []\n",
+    "    for index in tqdm(range(len(test_images))):\n",
+    "        hist = find_hist(x_test_desc[index], codebook)\n",
+    "        x_test.append(hist)\n",
+    "\n",
+    "    x_test = np.array(x_test)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 44,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "clf_params = {'kernel': ['rbf', 'linear', 'sigmoid'],\n",
+    "              'C': [0.01, 0.1 ,1, 10, 100, 1000],\n",
+    "              'gamma': ['scale', 'auto'],\n",
+    "              'class_weight': ['balanced']\n",
+    "             }\n",
+    "\n",
+    "predict = model_SVM(x_train, train_labels, x_test, clf_params)\n",
+    "predict = predict.reshape(-1, 1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "submit = pd.read_csv(SUBMIT_PATH)\n",
+    "submit['Category'] = predict\n",
+    "\n",
+    "submit.to_csv('version.csv', index=False)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3.7.11 ('new_pd')",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.11"
+  },
+  "orig_nbformat": 4,
+  "vscode": {
+   "interpreter": {
+    "hash": "3a26e8a14db16b543d5f09ad5f88f246ef77c567a1c0276b78ec7a036387a821"
+   }
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
